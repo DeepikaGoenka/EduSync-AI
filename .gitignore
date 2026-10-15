@@ -1,0 +1,63 @@
+HELP.md
+target/
+.mvn/wrapper/maven-wrapper.jar
+!**/src/main/**/target/
+!**/src/test/**/target/
+
+### STS ###
+.apt_generated
+.classpath
+.factorypath
+.project
+.settings
+.springBeans
+.sts4-cache
+
+### IntelliJ IDEA ###
+.idea
+*.iws
+*.iml
+*.ipr
+
+### NetBeans ###
+/nbproject/private/
+/nbbuild/
+/dist/
+/nbdist/
+/.nb-gradle/
+build/
+!**/src/main/**/build/
+!**/src/test/**/build/
+
+### VS Code ###
+.vscode/
+
+```gitignore
+# Logs and crash dumps
+*.log
+hs_err_pid*.log
+
+# Python generated files
+__pycache__/
+*.py[cod]
+venv/
+.venv/
+
+# Generated media
+*.mp3
+*.wav
+*.mp4
+*.avi
+
+# Temporary files and uploads
+uploads/
+temp/
+tmp/
+
+# Local secrets
+.env
+.env.*
+!.env.example
+application-local.properties
+application-local.yml
+```
