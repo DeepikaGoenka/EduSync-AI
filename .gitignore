@@ -32,32 +32,32 @@ build/
 ### VS Code ###
 .vscode/
 
-```gitignore
-# Logs and crash dumps
+### Logs and crash dumps ###
 *.log
-hs_err_pid*.log
+hs_err_pid*
 
-# Python generated files
+### Python ###
 __pycache__/
 *.py[cod]
 venv/
 .venv/
 
-# Generated media
+### Generated media ###
+generated-slides/
+generated-audio/
 *.mp3
 *.wav
 *.mp4
 *.avi
 
-# Temporary files and uploads
+### Temp and uploads ###
 uploads/
 temp/
 tmp/
 
-# Local secrets
+### Local secrets ###
 .env
 .env.*
 !.env.example
 application-local.properties
 application-local.yml
-```
