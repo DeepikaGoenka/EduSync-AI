@@ -45,7 +45,8 @@ public class SyllabusAlignmentService {
             "type", "concept", "concepts", "model", "models", "need", "definition",
             "introduction", "overview", "different", "efficient", "defining");
 
-    private static final Pattern TOKEN = Pattern.compile("[a-z0-9]+");
+    // Words with optional inner hyphens, e.g. "pre-processing".
+    private static final Pattern TOKEN = Pattern.compile("[a-z0-9]+(?:-[a-z0-9]+)*");
     private static final Pattern NUMBERED = Pattern.compile("\\b\\d{1,3}\\.\\s+[A-Z]");
     private static final Pattern EXPLAIN = Pattern.compile(
             "\\b(is|are|means|refers|defined|definition|stands for|consists|used to|"
@@ -53,6 +54,10 @@ public class SyllabusAlignmentService {
             Pattern.CASE_INSENSITIVE);
     private static final Pattern BOOKS = Pattern.compile(
             "(?i)\\b(text\\s*/\\s*reference\\s*books?|reference\\s*books?|text\\s*books?)\\b");
+    // "B and C" or "B and C heads": two single words joined by "and".
+    private static final Pattern AND_PAIR = Pattern.compile(
+            "^([A-Za-z0-9][A-Za-z0-9-]*)\\s+(?:and|&)\\s+([A-Za-z0-9][A-Za-z0-9-]*)(?:\\s+(.+))?$",
+            Pattern.CASE_INSENSITIVE);
 
     private record TopicSpec(String display, String sub, String parent) {
     }
@@ -252,6 +257,8 @@ public class SyllabusAlignmentService {
                 ChunkInfo info = infos.get(bestChunk);
                 boolean allTight = bestTight.matchedCount == nT;
                 boolean allWide = bestWide.matchedCount == nT;
+                // Short topics (2-3 words) must match with all words close together.
+                boolean nearOk = nT <= 1 || (nT <= 3 ? allTight : allWide);
                 bestLexRatio = bestWide.weight / totalWeight;
                 boolean anchorOk = anchor < 0 || bestWide.matched[anchor];
                 double specificRatio = specificCount == 0
@@ -264,8 +271,8 @@ public class SyllabusAlignmentService {
                 boolean explained = hasExplanation(info.text(), offset);
 
                 boolean strong = (bestPhrase && bestSem >= SEM_PHRASE)
-                        || (anchorOk && specificRatio >= 0.999 && bestLexRatio >= 0.85
-                                && (nT > 3 || allTight) && bestSem >= SEM_COVERED);
+                        || (nearOk && anchorOk && specificRatio >= 0.999
+                                && bestLexRatio >= 0.85 && bestSem >= SEM_COVERED);
 
                 boolean partial;
                 if (specificCount >= 2) {
@@ -277,6 +284,9 @@ public class SyllabusAlignmentService {
                                     || (bestWide.matchedCount >= nT - 1 && bestSem >= 0.65));
                 } else {
                     partial = allWide && bestSem >= 0.60;
+                }
+                if (nT >= 2 && nT <= 3 && !allTight) {
+                    partial = false;
                 }
 
                 if (strong) {
@@ -422,7 +432,7 @@ public class SyllabusAlignmentService {
 
         int idx = 0;
         while (m.find()) {
-            String s = stem(m.group());
+            String s = stem(m.group().replace("-", ""));
             offs.add(Math.min(m.start(), Math.max(0, text.length() - 1)));
             exact.computeIfAbsent(s, k -> new ArrayList<>()).add(idx);
             if (s.length() >= 7) {
@@ -481,6 +491,8 @@ public class SyllabusAlignmentService {
         String s = word;
         if (s.length() > 5 && s.endsWith("ing")) {
             s = s.substring(0, s.length() - 3);
+        } else if (s.length() > 5 && s.endsWith("ed")) {
+            s = s.substring(0, s.length() - 2);
         } else if (s.length() > 3 && s.endsWith("s") && !s.endsWith("ss")) {
             s = s.substring(0, s.length() - 1);
         }
@@ -489,7 +501,9 @@ public class SyllabusAlignmentService {
 
     private List<String> tokenize(String text) {
         List<String> out = new ArrayList<>();
-        for (String t : text.toLowerCase(Locale.ROOT).split("[^a-z0-9]+")) {
+        Matcher m = TOKEN.matcher(text.toLowerCase(Locale.ROOT));
+        while (m.find()) {
+            String t = m.group().replace("-", "");
             if (!t.isEmpty()) {
                 out.add(t);
             }
@@ -554,70 +568,123 @@ public class SyllabusAlignmentService {
         return topics;
     }
 
-    // Splits one line like "Main: a, b, c; d. Other: e, f" into topics with parents.
-    private void splitLine(String line, List<TopicSpec> topics, Set<String> seen) {
+    private void splitLine(String rawLine, List<TopicSpec> topics, Set<String> seen) {
+        String line = rawLine;
+
+        // A long merged line starts with the unit title: "Unit title: topic, topic, ..."
+        int commas = 0;
+        for (int i = 0; i < line.length(); i++) {
+            if (line.charAt(i) == ',') {
+                commas++;
+            }
+        }
+        if (commas >= 3) {
+            int c = line.indexOf(':');
+            if (c > 0) {
+                String before = line.substring(0, c);
+                if (before.indexOf(',') < 0 && before.trim().split("\\s+").length <= 10) {
+                    line = line.substring(c + 1).trim();
+                }
+            }
+        }
+
+        // Sentences end at ';' or at a '.' followed by space or end of line.
+        for (String sentence : line.split(";|\\.(?=\\s|$)")) {
+            processSentence(sentence.trim(), topics, seen);
+        }
+    }
+
+    private void processSentence(String sentence, List<TopicSpec> topics, Set<String> seen) {
+        if (sentence.isEmpty()) {
+            return;
+        }
+
+        List<String> parts = new ArrayList<>();
+        for (String p : sentence.split(",")) {
+            String t = p.trim();
+            if (!t.isEmpty()) {
+                parts.add(t);
+            }
+        }
+
         String parent = "";
-        StringBuilder cur = new StringBuilder();
 
-        for (int i = 0; i <= line.length(); i++) {
-            char ch = i < line.length() ? line.charAt(i) : ';';
+        for (int i = 0; i < parts.size(); i++) {
+            String token = parts.get(i);
 
-            boolean boundary;
-            boolean resetParent = false;
-
-            if (ch == ',') {
-                boundary = true;
-            } else if (ch == ';') {
-                boundary = true;
-                resetParent = true;
-            } else if (ch == '.' && (i + 1 >= line.length()
-                    || Character.isWhitespace(line.charAt(i + 1)))) {
-                boundary = true;
-                resetParent = true;
-            } else {
-                boundary = false;
+            // "Parent: item" sets the parent for the items that follow.
+            int colon = token.lastIndexOf(':');
+            if (colon >= 0) {
+                String left = token.substring(0, colon);
+                int prev = left.lastIndexOf(':');
+                String newParent = (prev >= 0 ? left.substring(prev + 1) : left).trim();
+                if (!newParent.isEmpty()) {
+                    parent = newParent;
+                }
+                token = token.substring(colon + 1).trim();
             }
 
-            if (!boundary) {
-                cur.append(ch);
+            token = token.replaceFirst("(?i)^and\\s+", "")
+                    .replaceAll("\\s+", " ")
+                    .trim();
+            if (token.isEmpty()) {
                 continue;
             }
 
-            String token = cur.toString().trim();
-            cur.setLength(0);
+            List<String> items = new ArrayList<>();
+            boolean endsList;
 
-            if (!token.isEmpty()) {
-                int colon = token.lastIndexOf(':');
-                if (colon >= 0) {
-                    String left = token.substring(0, colon);
-                    int prev = left.lastIndexOf(':');
-                    String newParent = (prev >= 0 ? left.substring(prev + 1) : left).trim();
-                    if (!newParent.isEmpty()) {
-                        parent = newParent;
-                    }
-                    token = token.substring(colon + 1).trim();
-                }
+            // "Star, snowflake and galaxy schemas" -> three topics sharing the head noun.
+            Matcher next = null;
+            if (i + 1 < parts.size() && !token.contains(" ")
+                    && parts.get(i + 1).indexOf(':') < 0) {
+                next = AND_PAIR.matcher(parts.get(i + 1).trim());
+            }
 
-                token = token.replaceFirst("(?i)^and\\s+", "")
-                        .replaceAll("\\s+", " ")
-                        .trim();
-
-                if (isUsableTopic(token)) {
-                    boolean single = !token.contains(" ");
-                    boolean shortParent = !parent.isEmpty() && parent.split("\\s+").length <= 4;
-                    String sub = (single && shortParent) ? parent + " " + token : token;
-                    String display = parent.isEmpty() ? token : parent + ": " + token;
-
-                    if (seen.add(normalize(display))) {
-                        topics.add(new TopicSpec(display, sub, parent));
-                    }
+            if (next != null && next.matches() && next.group(3) != null
+                    && pluralHead(next.group(3))) {
+                String head = next.group(3).trim();
+                items.add(token + " " + head);
+                items.add(next.group(1) + " " + head);
+                items.add(next.group(2) + " " + head);
+                i++;
+                endsList = true;
+            } else {
+                Matcher m = AND_PAIR.matcher(token);
+                if (m.matches()) {
+                    // "Linear and Non-linear regression" -> two topics.
+                    String head = m.group(3) == null ? "" : " " + m.group(3).trim();
+                    items.add(m.group(1) + head);
+                    items.add(m.group(2) + head);
+                    endsList = true;
+                } else {
+                    items.add(token);
+                    endsList = token.toLowerCase(Locale.ROOT).contains(" and ");
                 }
             }
 
-            if (resetParent) {
+            for (String item : items) {
+                String clean = item.replaceAll("\\s+", " ").trim();
+                if (!isUsableTopic(clean)) {
+                    continue;
+                }
+                String display = parent.isEmpty() ? clean : parent + ": " + clean;
+                if (seen.add(normalize(display))) {
+                    topics.add(new TopicSpec(display, clean, parent));
+                }
+            }
+
+            // An "X and Y" item closes the parent's list.
+            if (endsList) {
                 parent = "";
             }
         }
+    }
+
+    private boolean pluralHead(String head) {
+        String w = head.trim().split("\\s+")[0].toLowerCase(Locale.ROOT);
+        return w.length() > 3 && w.endsWith("s")
+                && !w.endsWith("ss") && !w.endsWith("is") && !w.endsWith("us");
     }
 
     private boolean isUsableTopic(String token) {
@@ -633,6 +700,7 @@ public class SyllabusAlignmentService {
 
     private String normalize(String value) {
         return value.toLowerCase(Locale.ROOT)
+                .replaceAll("(?<=[a-z0-9])-(?=[a-z0-9])", "")
                 .replaceAll("[^a-z0-9]+", " ")
                 .trim()
                 .replaceAll("\\s+", " ");
