@@ -43,7 +43,7 @@ public class SyllabusAlignmentController {
         System.out.println("SYLLABUS EXTRACTED TEXT:\n" + syllabusText);
 System.out.println("MATERIAL EXTRACTED LENGTH: " + materialText.length());
 
-        return alignmentService.compareSyllabusAndMaterial(
+        return alignmentService.compareWithRetrieval(
                 syllabusText, materialText);
     }
 }

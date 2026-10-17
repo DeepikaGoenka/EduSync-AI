@@ -5,6 +5,7 @@ import com.fasterxml.jackson.databind.ObjectMapper;
 
 import java.time.Duration;
 import java.util.Map;
+import java.util.HashMap;
 
 import org.springframework.http.MediaType;
 import org.springframework.http.client.SimpleClientHttpRequestFactory;
@@ -16,6 +17,8 @@ public class AIService {
 
     private final RestClient restClient;
     private final ObjectMapper objectMapper;
+        private static final String MODEL = "qwen2.5:3b";
+    private static final int NUM_CTX = 4096;
 
     public AIService() {
 
@@ -43,9 +46,10 @@ public class AIService {
     // Use this method specifically for lecture batches.
     public String askAIForLectureBatch(String prompt) {
 
-        Map<String, Object> options = Map.of(
+                 Map<String, Object> options = Map.of(
                 "num_predict", 700,
-                "temperature", 0.2
+                "temperature", 0.2,
+                "num_ctx", NUM_CTX
         );
 
         return callOllama(prompt, options);
@@ -61,14 +65,15 @@ public String askAIForJson(String prompt) {
     }
 
     try {
-        Map<String, Object> options = Map.of(
+                Map<String, Object> options = Map.of(
                 "temperature", 0.1,
-                "num_predict", 2500
+                "num_predict", 1000,
+                "num_ctx", NUM_CTX
         );
 
         String requestBody = objectMapper.writeValueAsString(
                 Map.of(
-                        "model", "qwen2.5:1.5b",
+                        "model", MODEL,
                         "prompt", prompt,
                         "stream", false,
                         "format", "json",
@@ -108,6 +113,39 @@ public String askAIForJson(String prompt) {
                 "Ollama JSON generation failed: " + e.getMessage(), e);
     }
 }
+    // Short JSON answer for yes/no style judgements. Much faster than askAIForJson.
+    public String askAIForJudge(String prompt) {
+        try {
+            Map<String, Object> options = Map.of(
+                    "temperature", 0.0,
+                    "num_predict", 80,
+                    "num_ctx", 2048
+            );
+
+            String requestBody = objectMapper.writeValueAsString(
+                    Map.of(
+                            "model", MODEL,
+                            "prompt", prompt,
+                            "stream", false,
+                            "format", "json",
+                            "options", options,
+                            "keep_alive", "30m"
+                    )
+            );
+
+            byte[] bytes = restClient.post()
+                    .uri("/api/generate")
+                    .contentType(MediaType.APPLICATION_JSON)
+                    .accept(MediaType.APPLICATION_JSON)
+                    .body(requestBody)
+                    .retrieve()
+                    .body(byte[].class);
+
+            return objectMapper.readTree(bytes).path("response").asText("");
+        } catch (Exception e) {
+            throw new RuntimeException("Judge call failed: " + e.getMessage(), e);
+        }
+    }
 
 
     private String callOllama(
@@ -119,15 +157,17 @@ public String askAIForJson(String prompt) {
                     "AI prompt cannot be empty."
             );
         }
-
+        Map<String, Object> merged = new HashMap<>(options);
+        merged.putIfAbsent("num_ctx", NUM_CTX);
+        merged.putIfAbsent("temperature", 0.3);
         try {
 
             String requestBody = objectMapper.writeValueAsString(
                     new OllamaRequest(
-                            "qwen2.5:1.5b",
+                            MODEL,
                             prompt,
                             false,
-                            options,
+                            merged,
                             "10m"
                     )
             );

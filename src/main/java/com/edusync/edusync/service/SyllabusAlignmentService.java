@@ -1,15 +1,18 @@
-
 package com.edusync.edusync.service;
 
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Locale;
 import java.util.Map;
+import java.util.Set;
+import java.util.TreeSet;
+import java.util.regex.Matcher;
+import java.util.regex.Pattern;
 
 import org.springframework.stereotype.Service;
 
-import com.fasterxml.jackson.databind.JsonNode;
 import com.fasterxml.jackson.databind.ObjectMapper;
 import com.fasterxml.jackson.databind.node.ArrayNode;
 import com.fasterxml.jackson.databind.node.ObjectNode;
@@ -17,214 +20,503 @@ import com.fasterxml.jackson.databind.node.ObjectNode;
 @Service
 public class SyllabusAlignmentService {
 
+    private static final int CHUNK_SIZE = 900;
+    private static final int CHUNK_OVERLAP = 150;
+    private static final int MAX_TOPICS = 150;
+
+    // Key terms must appear within this many words of each other.
+    private static final int TIGHT_WINDOW = 12;
+    private static final int WIDE_WINDOW = 50;
+
+    // Embedding similarity thresholds.
+    private static final double SEM_PHRASE = 0.45;
+    private static final double SEM_PARTIAL = 0.50;
+    private static final double SEM_COVERED = 0.55;
+
+    private static final Set<String> STOP = Set.of(
+            "a", "an", "the", "and", "or", "of", "in", "on", "for", "to", "from",
+            "with", "by", "vs", "via", "is", "are", "as", "at", "its", "their",
+            "into", "over", "dbs", "dws");
+
+    // Words too common in this subject to prove coverage on their own.
+    private static final Set<String> GENERIC = Set.of(
+            "data", "mining", "analysis", "technique", "techniques", "method",
+            "methods", "various", "large", "based", "system", "systems", "types",
+            "type", "concept", "concepts", "model", "models", "need", "definition",
+            "introduction", "overview", "different", "efficient", "defining");
+
+    private static final Pattern TOKEN = Pattern.compile("[a-z0-9]+");
+    private static final Pattern NUMBERED = Pattern.compile("\\b\\d{1,3}\\.\\s+[A-Z]");
+    private static final Pattern EXPLAIN = Pattern.compile(
+            "\\b(is|are|means|refers|defined|definition|stands for|consists|used to|"
+                    + "process of|helps|allows|describes|designed|known as|called)\\b",
+            Pattern.CASE_INSENSITIVE);
+    private static final Pattern BOOKS = Pattern.compile(
+            "(?i)\\b(text\\s*/\\s*reference\\s*books?|reference\\s*books?|text\\s*books?)\\b");
+
+    private record TopicSpec(String display, String sub, String parent) {
+    }
+
+    private record ChunkInfo(String text, String padded, int[] offsets,
+                             Map<String, List<Integer>> exact,
+                             Map<String, List<Integer>> prefix) {
+    }
+
+    private static class Win {
+        double weight = 0;
+        int matchedCount = 0;
+        int specificMatched = 0;
+        int startToken = -1;
+        boolean[] matched;
+
+        Win(int n) {
+            matched = new boolean[n];
+        }
+    }
+
     private final TopicExtractionService topicExtractionService;
-    private final AIService aiService;
+    private final ChunkService chunkService;
+    private final EmbeddingService embeddingService;
     private final ObjectMapper objectMapper = new ObjectMapper();
 
     public SyllabusAlignmentService(
             TopicExtractionService topicExtractionService,
-            AIService aiService) {
+            ChunkService chunkService,
+            EmbeddingService embeddingService) {
         this.topicExtractionService = topicExtractionService;
-        this.aiService = aiService;
+        this.chunkService = chunkService;
+        this.embeddingService = embeddingService;
     }
 
-    public String compareSyllabusAndMaterial(
-            String syllabusText,
-            String materialText) {
+    // Kept so older callers still compile.
+    public String compareSyllabusAndMaterial(String syllabusText, String materialText) {
+        return compareWithRetrieval(syllabusText, materialText);
+    }
+
+    public String compareWithRetrieval(String syllabusText, String materialText) {
+
+        long start = System.currentTimeMillis();
 
         if (syllabusText == null || syllabusText.isBlank()) {
-            throw new IllegalArgumentException(
-                    "Syllabus content cannot be empty.");
+            throw new IllegalArgumentException("Syllabus content cannot be empty.");
         }
-
         if (materialText == null || materialText.isBlank()) {
-            throw new IllegalArgumentException(
-                    "Study material content cannot be empty.");
+            throw new IllegalArgumentException("Study material content cannot be empty.");
         }
 
-        String extractedSyllabus =
-                topicExtractionService.extractTopics(syllabusText);
+        // 1. Syllabus topics. The model lists them, the code splits them.
+        String extracted = topicExtractionService.extractTopics(syllabusText);
+        System.out.println("EXTRACTED TOPICS:\n" + extracted);
 
-        if (extractedSyllabus == null || extractedSyllabus.isBlank()) {
-            throw new IllegalStateException(
-                    "Could not extract topics from the syllabus.");
-        }
-
-        List<String> syllabusTopics =
-                parseSyllabusTopics(extractedSyllabus);
-
-        if (syllabusTopics.isEmpty()) {
+        List<TopicSpec> topics = parseSyllabusTopics(extracted);
+        if (topics.isEmpty()) {
             throw new IllegalStateException(
                     "No syllabus topics were found. Check the syllabus extraction output.");
         }
-
-        // Give each syllabus topic a stable numeric ID.
-        StringBuilder topicList = new StringBuilder();
-
-        for (int i = 0; i < syllabusTopics.size(); i++) {
-            topicList.append("ID ")
-                    .append(i + 1)
-                    .append(": ")
-                    .append(syllabusTopics.get(i))
-                    .append("\n");
+        if (topics.size() > MAX_TOPICS) {
+            topics = new ArrayList<>(topics.subList(0, MAX_TOPICS));
         }
 
-        String prompt = """
-                You are EduSync AI, an academic syllabus coverage evaluator.
+        // 2. Chunk the material and drop junk chunks (question lists, indexes).
+        List<String> rawChunks = chunkService.chunk(materialText, CHUNK_SIZE, CHUNK_OVERLAP);
+        List<String> chunks = new ArrayList<>();
+        int dropped = 0;
+        for (String c : rawChunks) {
+            if (c == null || c.isBlank()) {
+                continue;
+            }
+            if (isJunkChunk(c)) {
+                dropped++;
+                continue;
+            }
+            chunks.add(c);
+        }
+        if (chunks.isEmpty()) {
+            throw new IllegalStateException("No usable text found in the study material.");
+        }
+        System.out.println("[ALIGN] topics=" + topics.size()
+                + " chunks=" + chunks.size() + " droppedJunk=" + dropped);
 
-                TASK:
-                Evaluate each numbered syllabus topic against the FULL
-                study material supplied below.
+        // 3. Embed chunks and topics (batched, no LLM).
+        List<String> docs = new ArrayList<>();
+        List<ChunkInfo> infos = new ArrayList<>();
+        for (String c : chunks) {
+            docs.add("search_document: " + c);
+            infos.add(buildInfo(c));
+        }
+        List<double[]> chunkVectors = embeddingService.embedAll(docs);
 
-                Return valid JSON only in this format:
-                {
-                  "topics": [
-                    {
-                      "id": 1,
-                      "status": "COVERED",
-                      "evidence": "Short evidence from the study material"
+        List<String> queries = new ArrayList<>();
+        for (TopicSpec t : topics) {
+            queries.add("search_query: " + t.display());
+        }
+        List<double[]> topicVectors = embeddingService.embedAll(queries);
+        System.out.println("[ALIGN] embeddings done ms=" + (System.currentTimeMillis() - start));
+
+        // 4. Score every topic.
+        int n = infos.size();
+        ArrayNode finalTopics = objectMapper.createArrayNode();
+        int covered = 0;
+        int partiallyCovered = 0;
+        int missing = 0;
+
+        for (int t = 0; t < topics.size(); t++) {
+            TopicSpec spec = topics.get(t);
+            List<String> terms = keyTerms(spec.sub());
+            int nT = terms.size();
+
+            String status = "MISSING";
+            String evidence = "No section of your notes explains this topic.";
+            double bestLexRatio = 0;
+            double bestSem = 0;
+            ArrayNode found = objectMapper.createArrayNode();
+            ArrayNode notFound = objectMapper.createArrayNode();
+
+            if (nT == 0) {
+                for (String x : tokenize(spec.sub())) {
+                    notFound.add(x);
+                }
+            } else {
+                List<String> stems = new ArrayList<>();
+                boolean[] specific = new boolean[nT];
+                int specificCount = 0;
+                for (int j = 0; j < nT; j++) {
+                    stems.add(stem(terms.get(j)));
+                    specific[j] = !GENERIC.contains(terms.get(j));
+                    if (specific[j]) {
+                        specificCount++;
                     }
-                  ]
                 }
 
-                STATUS RULES:
-                COVERED:
-                The study material clearly discusses the topic with relevant
-                explanation, details, examples, or a meaningful section.
+                // Where does each term occur in each chunk?
+                List<List<List<Integer>>> pos = new ArrayList<>();
+                int[] df = new int[nT];
+                for (int i = 0; i < n; i++) {
+                    List<List<Integer>> row = new ArrayList<>();
+                    for (int j = 0; j < nT; j++) {
+                        List<Integer> p = positionsFor(infos.get(i), stems.get(j));
+                        if (!p.isEmpty()) {
+                            df[j]++;
+                        }
+                        row.add(p);
+                    }
+                    pos.add(row);
+                }
 
-                PARTIALLY COVERED:
-                The study material mentions or explains only part of the topic,
-                or gives related information without enough detail.
+                // Rare terms weigh more; generic terms weigh much less.
+                double[] weight = new double[nT];
+                double totalWeight = 0;
+                int anchor = -1;
+                for (int j = 0; j < nT; j++) {
+                    double base = 0.3 + Math.log((n + 1.0) / (df[j] + 1.0));
+                    weight[j] = specific[j] ? base : base * 0.25;
+                    totalWeight += weight[j];
+                    if (specific[j] && (anchor < 0 || weight[j] > weight[anchor])) {
+                        anchor = j;
+                    }
+                }
 
-                MISSING:
-                The topic is not supported by the study material.
+                String topicNorm = normalize(spec.sub());
+                double[] topicVec = topicVectors.get(t);
 
-                IMPORTANT RULES:
-                1. Evaluate every supplied topic ID separately.
-                2. Return the original numeric ID exactly.
-                3. Never return a topic name instead of its ID.
-                4. Never invent an ID.
-                5. Use only COVERED, PARTIALLY COVERED, or MISSING.
-                6. Do not mark a topic COVERED merely because a similar word appears.
-                7. Judge meaning, not exact wording alone.
-                8. Evidence must be based on the supplied study material.
-                9. Do not claim that content exists if it is not present.
-                10. Return one result per topic whenever possible.
-                11. Do not calculate totals or percentages.
-                12. Do not include Markdown fences or additional text.
+                // Pick the best chunk.
+                double bestScore = -1;
+                int bestChunk = 0;
+                Win bestWide = null;
+                Win bestTight = null;
+                boolean bestPhrase = false;
 
-                SYLLABUS TOPICS:
-                """ + topicList + """
+                for (int i = 0; i < n; i++) {
+                    Win wide = bestWindow(pos.get(i), WIDE_WINDOW, weight, specific);
+                    Win tight = bestWindow(pos.get(i), TIGHT_WINDOW, weight, specific);
+                    boolean phrase = topicNorm.length() >= 5
+                            && infos.get(i).padded().contains(" " + topicNorm + " ");
+                    double sem = EmbeddingService.cosine(topicVec, chunkVectors.get(i));
+                    double semNorm = Math.max(0, Math.min(1, (sem - 0.45) / 0.40));
+                    double lexWide = wide.weight / totalWeight;
+                    double lexTight = tight.weight / totalWeight;
+                    double score = phrase
+                            ? 2.0 + sem
+                            : 0.6 * lexWide + 0.1 * lexTight + 0.3 * semNorm;
 
-                FULL STUDY MATERIAL:
-                """ + materialText;
+                    if (score > bestScore) {
+                        bestScore = score;
+                        bestChunk = i;
+                        bestWide = wide;
+                        bestTight = tight;
+                        bestPhrase = phrase;
+                        bestSem = sem;
+                    }
+                }
 
-        String aiResponse = aiService.askAIForJson(prompt);
+                ChunkInfo info = infos.get(bestChunk);
+                boolean allTight = bestTight.matchedCount == nT;
+                boolean allWide = bestWide.matchedCount == nT;
+                bestLexRatio = bestWide.weight / totalWeight;
+                boolean anchorOk = anchor < 0 || bestWide.matched[anchor];
+                double specificRatio = specificCount == 0
+                        ? (allWide ? 1.0 : 0.0)
+                        : bestWide.specificMatched / (double) specificCount;
+
+                int offset = bestWide.startToken >= 0
+                        ? info.offsets()[bestWide.startToken]
+                        : 0;
+                boolean explained = hasExplanation(info.text(), offset);
+
+                boolean strong = (bestPhrase && bestSem >= SEM_PHRASE)
+                        || (anchorOk && specificRatio >= 0.999 && bestLexRatio >= 0.85
+                                && (nT > 3 || allTight) && bestSem >= SEM_COVERED);
+
+                boolean partial;
+                if (specificCount >= 2) {
+                    partial = anchorOk && specificRatio >= 0.6 && bestSem >= SEM_PARTIAL;
+                } else if (specificCount == 1) {
+                    partial = anchorOk && bestSem >= SEM_PARTIAL
+                            && (nT == 1
+                                    || (allWide && bestSem >= SEM_COVERED)
+                                    || (bestWide.matchedCount >= nT - 1 && bestSem >= 0.65));
+                } else {
+                    partial = allWide && bestSem >= 0.60;
+                }
+
+                if (strong) {
+                    // A mention without any explanation is only a partial match.
+                    status = explained ? "COVERED" : "PARTIALLY COVERED";
+                } else if (partial) {
+                    status = "PARTIALLY COVERED";
+                }
+
+                for (int j = 0; j < nT; j++) {
+                    if (bestWide.matched[j]) {
+                        found.add(terms.get(j));
+                    } else {
+                        notFound.add(terms.get(j));
+                    }
+                }
+
+                if (!status.equals("MISSING")) {
+                    evidence = snippetAt(info.text(), offset);
+                }
+            }
+
+            System.out.printf("[ALIGN] lex=%.2f sem=%.3f status=%s topic=%s%n",
+                    bestLexRatio, bestSem, status, spec.display());
+
+            if (status.equals("COVERED")) {
+                covered++;
+            } else if (status.equals("PARTIALLY COVERED")) {
+                partiallyCovered++;
+            } else {
+                missing++;
+            }
+
+            ObjectNode item = objectMapper.createObjectNode();
+            item.put("topic", spec.display());
+            if (!spec.parent().isEmpty()) {
+                item.put("parent", spec.parent());
+            }
+            item.put("status", status);
+            item.put("evidence", evidence);
+            item.put("keywordMatch", round3(bestLexRatio));
+            item.put("matchScore", round3(bestSem));
+            item.set("foundTerms", found);
+            item.set("missingTerms", notFound);
+            finalTopics.add(item);
+        }
+
+        int total = finalTopics.size();
+        ObjectNode output = objectMapper.createObjectNode();
+        output.put("totalTopics", total);
+        output.put("covered", covered);
+        output.put("partiallyCovered", partiallyCovered);
+        output.put("missing", missing);
+        output.put("coveragePercentage",
+                total == 0 ? 0.0 : Math.round((covered * 10000.0) / total) / 100.0);
+        output.set("topics", finalTopics);
+
+        System.out.println("[ALIGN] DONE topics=" + total
+                + " total time ms=" + (System.currentTimeMillis() - start));
 
         try {
-            JsonNode root = objectMapper.readTree(cleanJson(aiResponse));
-            JsonNode aiTopics = root.path("topics");
-
-            Map<Integer, JsonNode> resultsById = new HashMap<>();
-
-            if (aiTopics.isArray()) {
-                for (JsonNode item : aiTopics) {
-                    JsonNode idNode = item.path("id");
-
-                    if (!idNode.canConvertToInt()) {
-                        continue;
-                    }
-
-                    int id = idNode.asInt();
-
-                    if (id >= 1 && id <= syllabusTopics.size()) {
-                        resultsById.putIfAbsent(id, item);
-                    }
-                }
-            }
-
-            ObjectNode output = objectMapper.createObjectNode();
-            ArrayNode finalTopics = objectMapper.createArrayNode();
-
-            int covered = 0;
-            int partiallyCovered = 0;
-            int missing = 0;
-
-            for (int i = 0; i < syllabusTopics.size(); i++) {
-                int id = i + 1;
-                String syllabusTopic = syllabusTopics.get(i);
-
-                JsonNode aiItem = resultsById.get(id);
-
-                String status = "MISSING";
-                String evidence =
-                        "The AI did not return a valid classification for this topic.";
-
-                if (aiItem != null) {
-                    String candidateStatus = aiItem.path("status")
-                            .asText("")
-                            .trim()
-                            .toUpperCase(Locale.ROOT);
-
-                    if (candidateStatus.equals("COVERED")
-                            || candidateStatus.equals("PARTIALLY COVERED")
-                            || candidateStatus.equals("MISSING")) {
-                        status = candidateStatus;
-
-                        String candidateEvidence = aiItem.path("evidence")
-                                .asText("")
-                                .trim();
-
-                        if (!candidateEvidence.isBlank()) {
-                            evidence = candidateEvidence;
-                        }
-                    }
-                }
-
-                if (status.equals("COVERED")) {
-                    covered++;
-                } else if (status.equals("PARTIALLY COVERED")) {
-                    partiallyCovered++;
-                } else {
-                    missing++;
-                }
-
-                ObjectNode topicResult = objectMapper.createObjectNode();
-                topicResult.put("topic", syllabusTopic);
-                topicResult.put("status", status);
-                topicResult.put("evidence", evidence);
-
-                finalTopics.add(topicResult);
-            }
-
-            int totalTopics = finalTopics.size();
-
-            double coveragePercentage = totalTopics == 0
-                    ? 0.0
-                    : Math.round(
-                            (covered * 10000.0) / totalTopics) / 100.0;
-
-            output.put("totalTopics", totalTopics);
-            output.put("covered", covered);
-            output.put("partiallyCovered", partiallyCovered);
-            output.put("missing", missing);
-            output.put("coveragePercentage", coveragePercentage);
-            output.set("topics", finalTopics);
-
-            return objectMapper.writerWithDefaultPrettyPrinter()
-                    .writeValueAsString(output);
-
+            return objectMapper.writerWithDefaultPrettyPrinter().writeValueAsString(output);
         } catch (Exception e) {
-            throw new RuntimeException(
-                    "Could not validate the AI alignment response: "
-                            + e.getMessage()
-                            + ". Raw AI response: " + aiResponse,
-                    e);
+            throw new RuntimeException("Could not build alignment result", e);
         }
     }
 
-    private List<String> parseSyllabusTopics(String extractedSyllabus) {
-        List<String> topics = new ArrayList<>();
+    // ---------- window matching ----------
+
+    // Finds the window of 'window' words that covers the most term weight.
+    private Win bestWindow(List<List<Integer>> posByTerm, int window,
+                           double[] weight, boolean[] specific) {
+        int nTerms = posByTerm.size();
+        List<int[]> events = new ArrayList<>();
+        for (int j = 0; j < nTerms; j++) {
+            for (int p : posByTerm.get(j)) {
+                events.add(new int[] { p, j });
+            }
+        }
+        events.sort((a, b) -> a[0] != b[0]
+                ? Integer.compare(a[0], b[0])
+                : Integer.compare(a[1], b[1]));
+
+        Win best = new Win(nTerms);
+        int[] cnt = new int[nTerms];
+        double cur = 0;
+        int distinct = 0;
+        int l = 0;
+
+        for (int r = 0; r < events.size(); r++) {
+            int[] ev = events.get(r);
+            if (cnt[ev[1]]++ == 0) {
+                cur += weight[ev[1]];
+                distinct++;
+            }
+            while (ev[0] - events.get(l)[0] > window) {
+                int t = events.get(l)[1];
+                if (--cnt[t] == 0) {
+                    cur -= weight[t];
+                    distinct--;
+                }
+                l++;
+            }
+            if (cur > best.weight + 1e-9) {
+                best.weight = cur;
+                best.matchedCount = distinct;
+                best.startToken = events.get(l)[0];
+                int sm = 0;
+                for (int t = 0; t < nTerms; t++) {
+                    best.matched[t] = cnt[t] > 0;
+                    if (cnt[t] > 0 && specific[t]) {
+                        sm++;
+                    }
+                }
+                best.specificMatched = sm;
+            }
+        }
+        return best;
+    }
+
+    private List<Integer> positionsFor(ChunkInfo info, String termStem) {
+        TreeSet<Integer> set = new TreeSet<>();
+        List<Integer> e = info.exact().get(termStem);
+        if (e != null) {
+            set.addAll(e);
+        }
+        if (termStem.length() >= 7) {
+            List<Integer> p = info.prefix().get(termStem.substring(0, 6));
+            if (p != null) {
+                set.addAll(p);
+            }
+        }
+        return new ArrayList<>(set);
+    }
+
+    private ChunkInfo buildInfo(String text) {
+        String lower = text.toLowerCase(Locale.ROOT);
+        Matcher m = TOKEN.matcher(lower);
+
+        List<Integer> offs = new ArrayList<>();
+        Map<String, List<Integer>> exact = new HashMap<>();
+        Map<String, List<Integer>> prefix = new HashMap<>();
+
+        int idx = 0;
+        while (m.find()) {
+            String s = stem(m.group());
+            offs.add(Math.min(m.start(), Math.max(0, text.length() - 1)));
+            exact.computeIfAbsent(s, k -> new ArrayList<>()).add(idx);
+            if (s.length() >= 7) {
+                prefix.computeIfAbsent(s.substring(0, 6), k -> new ArrayList<>()).add(idx);
+            }
+            idx++;
+        }
+
+        int[] offsets = new int[offs.size()];
+        for (int i = 0; i < offsets.length; i++) {
+            offsets[i] = offs.get(i);
+        }
+        return new ChunkInfo(text, " " + normalize(text) + " ", offsets, exact, prefix);
+    }
+
+    // ---------- helpers ----------
+
+    private boolean isJunkChunk(String chunk) {
+        Matcher m = NUMBERED.matcher(chunk);
+        int numbered = 0;
+        while (m.find()) {
+            numbered++;
+        }
+        if (numbered >= 6) {
+            return true;   // numbered list of questions or an index
+        }
+        int questions = 0;
+        for (int i = 0; i < chunk.length(); i++) {
+            if (chunk.charAt(i) == '?') {
+                questions++;
+            }
+        }
+        return questions >= 4;
+    }
+
+    private boolean hasExplanation(String text, int offset) {
+        int from = Math.max(0, offset - 150);
+        int to = Math.min(text.length(), offset + 450);
+        if (from >= to) {
+            return false;
+        }
+        return EXPLAIN.matcher(text.substring(from, to)).find();
+    }
+
+    private List<String> keyTerms(String sub) {
+        LinkedHashSet<String> all = new LinkedHashSet<>();
+        for (String t : tokenize(sub)) {
+            if (t.length() >= 2 && !STOP.contains(t)) {
+                all.add(t);
+            }
+        }
+        return new ArrayList<>(all);
+    }
+
+    private String stem(String word) {
+        String s = word;
+        if (s.length() > 5 && s.endsWith("ing")) {
+            s = s.substring(0, s.length() - 3);
+        } else if (s.length() > 3 && s.endsWith("s") && !s.endsWith("ss")) {
+            s = s.substring(0, s.length() - 1);
+        }
+        return s;
+    }
+
+    private List<String> tokenize(String text) {
+        List<String> out = new ArrayList<>();
+        for (String t : text.toLowerCase(Locale.ROOT).split("[^a-z0-9]+")) {
+            if (!t.isEmpty()) {
+                out.add(t);
+            }
+        }
+        return out;
+    }
+
+    private String snippetAt(String text, int offset) {
+        int from = Math.max(0, Math.min(offset - 60, text.length()));
+        int to = Math.min(text.length(), from + 320);
+        String s = text.substring(from, to).replaceAll("\\s+", " ").trim();
+        return (from > 0 ? "..." : "") + s + (to < text.length() ? "..." : "");
+    }
+
+    private double round3(double v) {
+        return Math.round(v * 1000) / 1000.0;
+    }
+
+    // ---------- topic parsing (splitting is done here, not by the model) ----------
+
+    private List<TopicSpec> parseSyllabusTopics(String extractedSyllabus) {
+        List<TopicSpec> topics = new ArrayList<>();
+        Set<String> seen = new LinkedHashSet<>();
+
+        if (extractedSyllabus == null) {
+            return topics;
+        }
 
         for (String rawLine : extractedSyllabus.split("\\R")) {
             String line = rawLine.trim();
@@ -233,9 +525,8 @@ public class SyllabusAlignmentService {
                 continue;
             }
 
-            // Skip unit headings.
-            if (line.matches(
-                    "(?i)^unit\\s+([ivxlcdm]+|\\d+)\\s*:?$")) {
+            // Skip unit headings on their own line.
+            if (line.matches("(?i)^unit[\\s-]*([ivxlcdm]+|\\d+)\\s*:?$")) {
                 continue;
             }
 
@@ -248,24 +539,96 @@ public class SyllabusAlignmentService {
                 continue;
             }
 
-            line = line.replaceAll("\\s+", " ").trim();
-
+            // Cut off the book list.
+            Matcher bm = BOOKS.matcher(line);
+            if (bm.find()) {
+                line = line.substring(0, bm.start()).trim();
+            }
             if (line.isBlank()) {
                 continue;
             }
 
-            String normalized = normalize(line);
-
-            boolean duplicate = topics.stream()
-                    .anyMatch(existing ->
-                            normalize(existing).equals(normalized));
-
-            if (!duplicate) {
-                topics.add(line);
-            }
+            splitLine(line, topics, seen);
         }
 
         return topics;
+    }
+
+    // Splits one line like "Main: a, b, c; d. Other: e, f" into topics with parents.
+    private void splitLine(String line, List<TopicSpec> topics, Set<String> seen) {
+        String parent = "";
+        StringBuilder cur = new StringBuilder();
+
+        for (int i = 0; i <= line.length(); i++) {
+            char ch = i < line.length() ? line.charAt(i) : ';';
+
+            boolean boundary;
+            boolean resetParent = false;
+
+            if (ch == ',') {
+                boundary = true;
+            } else if (ch == ';') {
+                boundary = true;
+                resetParent = true;
+            } else if (ch == '.' && (i + 1 >= line.length()
+                    || Character.isWhitespace(line.charAt(i + 1)))) {
+                boundary = true;
+                resetParent = true;
+            } else {
+                boundary = false;
+            }
+
+            if (!boundary) {
+                cur.append(ch);
+                continue;
+            }
+
+            String token = cur.toString().trim();
+            cur.setLength(0);
+
+            if (!token.isEmpty()) {
+                int colon = token.lastIndexOf(':');
+                if (colon >= 0) {
+                    String left = token.substring(0, colon);
+                    int prev = left.lastIndexOf(':');
+                    String newParent = (prev >= 0 ? left.substring(prev + 1) : left).trim();
+                    if (!newParent.isEmpty()) {
+                        parent = newParent;
+                    }
+                    token = token.substring(colon + 1).trim();
+                }
+
+                token = token.replaceFirst("(?i)^and\\s+", "")
+                        .replaceAll("\\s+", " ")
+                        .trim();
+
+                if (isUsableTopic(token)) {
+                    boolean single = !token.contains(" ");
+                    boolean shortParent = !parent.isEmpty() && parent.split("\\s+").length <= 4;
+                    String sub = (single && shortParent) ? parent + " " + token : token;
+                    String display = parent.isEmpty() ? token : parent + ": " + token;
+
+                    if (seen.add(normalize(display))) {
+                        topics.add(new TopicSpec(display, sub, parent));
+                    }
+                }
+            }
+
+            if (resetParent) {
+                parent = "";
+            }
+        }
+    }
+
+    private boolean isUsableTopic(String token) {
+        if (token == null || token.length() < 3 || token.length() > 120) {
+            return false;
+        }
+        if (!token.matches(".*[A-Za-z]{3,}.*")) {
+            return false;
+        }
+        return !token.toLowerCase(Locale.ROOT)
+                .matches("^(unit|module|chapter|hours?|marks?)\\b.*");
     }
 
     private String normalize(String value) {
@@ -274,35 +637,4 @@ public class SyllabusAlignmentService {
                 .trim()
                 .replaceAll("\\s+", " ");
     }
-
-private String cleanJson(String response) {
-    if (response == null || response.isBlank()) {
-        throw new IllegalStateException(
-                "AI returned an empty response.");
-    }
-
-    String cleaned = response.trim();
-
-    // Remove Markdown JSON fences if present.
-    cleaned = cleaned.replaceFirst(
-            "(?is)^\\s*```(?:json)?\\s*", "");
-    cleaned = cleaned.replaceFirst(
-            "(?s)\\s*```\\s*$", "");
-
-    // Extract a JSON object if the AI added introductory text.
-    int start = cleaned.indexOf('{');
-    int end = cleaned.lastIndexOf('}');
-
-    if (start >= 0 && end > start) {
-        cleaned = cleaned.substring(start, end + 1);
-    }
-
-    if (!cleaned.startsWith("{") || !cleaned.endsWith("}")) {
-        throw new IllegalStateException(
-                "AI did not return JSON. Response begins: "
-                        + cleaned.substring(0, Math.min(250, cleaned.length())));
-    }
-
-    return cleaned;
-}
 }

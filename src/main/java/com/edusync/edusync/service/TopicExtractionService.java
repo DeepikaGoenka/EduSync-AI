@@ -1,5 +1,9 @@
 package com.edusync.edusync.service;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Locale;
+
 import org.springframework.stereotype.Service;
 
 @Service
@@ -11,60 +15,111 @@ public class TopicExtractionService {
         this.aiService = aiService;
     }
 
-    
-public String extractTopics(String text) {
-    if (text == null || text.isBlank()) {
-        return "";
+    public String extractTopics(String text) {
+        if (text == null || text.isBlank()) {
+            return "";
+        }
+
+        String cleaned = text.replace("\r", "")
+                .replaceAll("[ \\t]+", " ")
+                .trim();
+
+        String prompt = """
+                You are extracting topics from a university syllabus.
+                The text may come from OCR and can contain small spelling errors.
+
+                Return plain text only, in exactly this format:
+                Unit I
+                - Topic
+                - Main topic: Subtopic
+
+                Rules:
+                1. Write one topic per line, each line starting with "- ".
+                2. If subtopics are listed under a main topic, write each one as
+                   "- Main topic: Subtopic" and repeat the main topic name on every line.
+                3. If items are separated by commas or semicolons, put each item on its own line.
+                4. Keep the original wording. Only fix obvious OCR spelling mistakes.
+                5. Do not merge different topics and do not repeat a topic.
+                6. Ignore course objectives, outcomes, books, marks and hours.
+                7. Do not invent topics. Return no introduction and no explanation.
+
+                SYLLABUS:
+                """ + cleaned;
+
+        String out = "";
+        try {
+            out = aiService.askAI(prompt);
+        } catch (Exception e) {
+            System.out.println("[TOPICS] model extraction failed: " + e.getMessage());
+        }
+
+        int bullets = countBullets(out);
+        if (bullets < 3) {
+            System.out.println("[TOPICS] model output unusable (" + bullets
+                    + " bullets). Using plain text fallback.");
+            return fallbackTopics(cleaned);
+        }
+
+        return out;
     }
 
-    String prompt = """
-            You are extracting topics from a university syllabus.
+    public String extractMaterialTopics(String text) {
+        if (text == null || text.isBlank()) {
+            return "";
+        }
 
-            Return plain text only.
+        String prompt = """
+                Extract the academic topics actually discussed in this study material.
 
-            Format:
-            Unit I
-            - Topic name
-            - Subtopic name
+                Rules:
+                1. Include only topics supported by the supplied text.
+                2. Preserve specific topic names.
+                3. Do not invent syllabus units.
+                4. Remove repeated topic names.
+                5. Ignore page numbers, headers and footers.
+                6. Return concise plain-text bullet points only.
 
-            Rules:
-            1. Extract every examinable topic and subtopic.
-            2. Preserve the original wording and order.
-            3. Keep each topic on a separate bullet line.
-            4. Preserve unit headings.
-            5. Do not combine different topics.
-            6. Do not repeat a topic.
-            7. Do not invent topics or units.
-            8. Ignore course objectives and learning outcomes.
-            9. If the text is unclear, do not guess.
-            10. Return no introduction or explanation.
+                STUDY MATERIAL:
+                """ + text;
 
-            SYLLABUS:
-            """ + text;
-
-    return aiService.askAI(prompt);
-}
-
-public String extractMaterialTopics(String text) {
-    if (text == null || text.isBlank()) {
-        return "";
+        return aiService.askAI(prompt);
     }
 
-    String prompt = """
-            Extract the academic topics actually discussed in this study material.
+    private int countBullets(String s) {
+        if (s == null) {
+            return 0;
+        }
+        int count = 0;
+        for (String line : s.split("\\R")) {
+            String t = line.trim();
+            if (t.matches("^[-*•]\\s+.+") || t.matches("^\\d+[.)]\\s+.+")) {
+                count++;
+            }
+        }
+        return count;
+    }
 
-            Rules:
-            1. Include only topics supported by the supplied text.
-            2. Preserve specific topic names.
-            3. Do not invent syllabus units.
-            4. Remove repeated topic names.
-            5. Ignore page numbers, headers and footers.
-            6. Return concise plain-text bullet points only.
+    // Used only when the model output is unusable: split the OCR text into short fragments.
+    private String fallbackTopics(String text) {
+        List<String> seen = new ArrayList<>();
+        StringBuilder sb = new StringBuilder("Unit I\n");
 
-            STUDY MATERIAL:
-            """ + text;
-
-    return aiService.askAI(prompt);
-}
-
+        for (String frag : text.split("[\\n;,•]+")) {
+            String t = frag.trim().replaceFirst("^\\d+[.)]\\s*", "").trim();
+            if (t.length() < 3 || t.length() > 90) {
+                continue;
+            }
+            if (t.toLowerCase(Locale.ROOT)
+                    .matches("^(unit|module|chapter|lecture|hours?|marks?)\\b.*")) {
+                continue;
+            }
+            String key = t.toLowerCase(Locale.ROOT);
+            if (seen.contains(key)) {
+                continue;
+            }
+            seen.add(key);
+            sb.append("- ").append(t).append("\n");
+        }
+        return sb.toString();
+    }
 }
