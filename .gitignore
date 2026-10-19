@@ -61,3 +61,5 @@ tmp/
 !.env.example
 application-local.properties
 application-local.yml
+
+generated-lectures/
