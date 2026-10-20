@@ -58,8 +58,6 @@ public class LectureVideoService {
     // 3rd Semester | 4"
     private static final Pattern FOOTER_GLUED = Pattern.compile(
             "\\b[A-Z][a-z]+(?: [A-Z][a-z]+)* [\u2013-] [A-Za-z0-9 ]{3,30} \\| \\d{1,3}\\b");
-    private static final Pattern PAGE_NOISE = Pattern.compile("^.{0,60}\\|\\s*\\d{1,3}$");
-    private static final Pattern TOC_LINE = Pattern.compile("^\\d{1,2}\\.\\s+\\d{1,2}\\.\\s+.*");
     private static final Pattern MAIN_HEADING = Pattern.compile("^(\\d{1,2})\\.\\s+([A-Z][A-Z0-9 &,()/'-]{3,80})$");
     private static final Pattern SUB_HEADING = Pattern.compile("^(\\d{1,2})\\.(\\d{1,2})\\.?\\s+([A-Z][^.!?]{2,90})$");
     private static final Pattern LETTER_HEADING = Pattern.compile("^[A-H]\\.\\s+([A-Z][^.!?]{2,60})$");
@@ -279,11 +277,8 @@ public class LectureVideoService {
         List<String> lines = new ArrayList<>();
 
         for (String raw : c.split("\n")) {
-            String l = raw.replace('\u00A0', ' ').replaceAll("[ \\t]+", " ").trim();
-            if (l.isEmpty() || l.equals("Contents")) {
-                continue;
-            }
-            if (PAGE_NOISE.matcher(l).matches() || TOC_LINE.matcher(l).matches()) {
+            String l = NotesTextCleaner.cleanLine(raw);   // drops footers/TOC, removes running list numbers
+            if (l == null || l.isEmpty() || l.equals("Contents")) {
                 continue;
             }
             lines.add(l);
@@ -935,29 +930,6 @@ public class LectureVideoService {
         }
         d.add(tFinal);
         return d;
-    }
-
-    private List<String> flowFromNotes(String text) {
-        String best = null;
-        int bestCount = 0;
-        for (String line : text.split("\n")) {
-            int c = line.split("\u2192", -1).length - 1;
-            if (c > bestCount) {
-                bestCount = c;
-                best = line;
-            }
-        }
-        List<String> flow = new ArrayList<>();
-        if (best == null || bestCount < 2) {
-            return flow;
-        }
-        for (String p : best.split("\u2192")) {
-            String t = clean(p);
-            if (t.length() >= 2 && t.length() <= 40) {
-                flow.add(t.equals(t.toUpperCase()) ? titleCase(t) : t);
-            }
-        }
-        return (flow.size() >= 3 && flow.size() <= 5) ? flow : new ArrayList<>();
     }
 
     // tts.py reads the text from a UTF-8 file and writes <base>.mp3 (edge-tts) or
